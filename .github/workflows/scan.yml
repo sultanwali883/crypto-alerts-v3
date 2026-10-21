@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
       - run: pip install requests
       - name: Run scanner loop (about 5h50m, checks every 3 minutes)
-        run: timeout 350m python alert_bot.py --loop || true
+        run: timeout 350m python -u alert_bot.py --loop || true
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
