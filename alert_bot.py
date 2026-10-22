@@ -9,6 +9,8 @@ Alerts you get on your phone (ntfy.sh and/or Telegram):
                You are told instead of being left in silence. Don't chase it.
   MOVED FAST   volume 3x+ and +10% in the last hour: a move you missed. Watch only.
   WATCH        early interest: volume rising and most of it is BUYING. NOT a buy signal.
+  TRIGGER      each WATCH alert carries a buy-trigger price (just above recent resistance). If the
+               price reaches it within 6h you get a BUY TRIGGERED alert with stop/target/size.
   HOURLY       every hour: price, profit/loss, distance to stop and target for each open trade.
   STOP/TARGET  detected using every 1-minute candle since entry, so a spike that touched
                your target and came back is still reported (with the time it happened).
@@ -135,10 +137,11 @@ def analyze(t):
     atr = sum(max(h[i] - lo[i], abs(h[i] - c[i - 1]), abs(lo[i] - c[i - 1]))
               for i in range(-14, 0)) / 14
     sp = max(2 * atr / c[-1] * 100, 1.0)           # stop never tighter than 1%
+    trig = max(max(h[-16:]) * 1.001, live * 1.003)  # just above the 4h high
     out = dict(sym=sym[:-4], price=c[-1], live=live, chg24=chg24, chg1h=chg1h,
                spike=spike, buyers=buyers, stop_pct=sp,
                rng24=(float(t["highPrice"]) / float(t["lowPrice"]) - 1) * 100,
-               qvol=float(t["quoteVolume"]))
+               qvol=float(t["quoteVolume"]), trig=trig, trig_pct=(trig / live - 1) * 100)
     if (spike >= 3 and 1.5 <= chg1h <= 10 and c[-1] > e20 > e50 and r <= 80
             and sp <= 6 and 0 <= chg24 <= 20):
         out["kind"] = "BUY"
@@ -148,7 +151,7 @@ def analyze(t):
           and -2 <= chg24 <= 25 and c[-1] > e20):
         out["kind"] = "WATCH"
     else:
-        return None
+        out["kind"] = None
     return out
 
 
@@ -182,7 +185,14 @@ def scan(state, hist):
         try: return analyze(t)
         except Exception: return None
     with ThreadPoolExecutor(8) as ex:
-        hits = [r for r in ex.map(safe, cand) if r]
+        scanned = [r for r in ex.map(safe, cand) if r]
+    hits = [r for r in scanned if r["kind"]]
+    cnt = lambda n: sum(1 for r in hits if r["kind"] == n)
+    print(f"Scanned {len(scanned)}/{len(cand)} coins | BUY {cnt('BUY')} WATCH {cnt('WATCH')} "
+          f"MOVED {cnt('MOVED')} | BTC {'ok' if btc_ok else 'falling'}")
+    for r in sorted(scanned, key=lambda x: -x["spike"])[:3]:
+        print(f"   busiest: {r['sym']} volume {r['spike']:.1f}x, buyers {r['buyers']:.0f}%, "
+              f"1h {r['chg1h']:+.1f}%, 24h {r['chg24']:+.1f}%")
 
     def is_open(sym): return state.get(sym, {}).get("open")
 
@@ -221,10 +231,17 @@ def scan(state, hist):
     # ---- WATCH (early interest, NOT a buy signal) ----
     for r in sorted((x for x in hits if x["kind"] == "WATCH"), key=lambda x: -x["spike"])[:3]:
         if not is_open(r["sym"]) and fresh("WATCH:" + r["sym"], WATCH_COOLDOWN_H):
+            fl, trig_line = flags(r), ""
+            trigs = hist.setdefault("triggers", {})
+            if r["trig_pct"] <= 6 and (r["sym"] in trigs or len(trigs) < 5):
+                trigs[r["sym"]] = dict(price=r["trig"], sp=r["stop_pct"], t=now,
+                                       checked=int(now * 1000), flags=fl, chg24=r["chg24"])
+                trig_line = (f"\nBuy trigger: {r['trig']:.6g} ({r['trig_pct']:+.1f}% from now). "
+                             f"If the price reaches it, I'll send a BUY alert (valid 6h).")
             tg(f"WATCH: {r['sym']}/USDT - buyers are showing interest.\n"
                f"Volume {r['spike']:.1f}x normal, {r['buyers']:.0f}% of it is buying, "
                f"{r['chg1h']:+.1f}% in the last hour (24h {r['chg24']:+.1f}%).\n"
-               f"{flags(r)}\nNOT a buy signal. Just keep an eye on it.", "Watch", "default")
+               f"{fl}{trig_line}\nNOT a buy signal yet. Just keep an eye on it.", "Watch", "default")
 
 
 def check_open(state, hist):
@@ -250,12 +267,47 @@ def check_open(state, hist):
             p["open"] = False
             pnl = (px / p["entry"] - 1) * 100
             hist["trades"].append(dict(sym=sym, entry=p["entry"], exit=px, t=now,
-                                       pnl=pnl - FEE_RT, kind=why.split()[0]))
+                                       pnl=pnl - FEE_RT, kind=why.split()[0],
+                                       src=p.get("src", "signal")))
             when = f" at {datetime.fromtimestamp(ts/1000, timezone.utc):%H:%M} UTC" if ts else ""
             tg(f"SELL {sym}/USDT: {why}{when}\n"
                f"Entry {p['entry']:.6g} -> {px:.6g} ({pnl:+.1f}%)\n"
                f"If your OCO order is set, it has already filled. Otherwise close it now.",
                "Sell", "urgent")
+
+
+def check_triggers(state, hist):
+    """Fire a BUY alert when a watched coin's price reaches its trigger (checks every 1m candle)."""
+    now = time.time()
+    trigs = hist.setdefault("triggers", {})
+    for sym, g in list(trigs.items()):
+        if now - g["t"] > 6 * 3600 or state.get(sym, {}).get("open"):
+            del trigs[sym]; continue
+        try:
+            k = get("/api/v3/klines", symbol=sym + "USDT", interval="1m",
+                    startTime=g["checked"], limit=1000)
+        except Exception:
+            continue
+        hit = next((x for x in k if float(x[2]) >= g["price"]), None)
+        if k: g["checked"] = k[-1][0]
+        if not hit: continue
+        del trigs[sym]
+        live = float(k[-1][4])
+        when = f"{datetime.fromtimestamp(hit[0]/1000, timezone.utc):%H:%M} UTC"
+        if live > g["price"] * (1 + MAX_CHASE_PCT / 100):
+            tg(f"TOO LATE: {sym}/USDT reached its trigger {g['price']:.6g} at {when}, but it is "
+               f"already {live:.6g} now. Not a buy: don't chase.", "Too late", "default")
+            continue
+        sp, entry = g["sp"], live
+        stop, target = entry * (1 - sp / 100), entry * (1 + 2 * sp / 100)
+        state[sym] = dict(entry=entry, stop=stop, target=target, t=now, checked=int(now * 1000),
+                          open=True, src="trigger")
+        tg(f"BUY TRIGGERED: {sym}/USDT reached {g['price']:.6g} (the level from the WATCH alert)\n"
+           f"Price now {entry:.6g} | 24h {g['chg24']:+.1f}%\n{g['flags']}\n"
+           f"Stop: -{sp:.1f}% ({stop:.6g})\n"
+           f"Target: +{2*sp:.1f}% ({target:.6g})\n"
+           f"Size: {min(20, 100/sp):.0f}% of account (stop-out = ~1% loss)\n"
+           f"I'll update you hourly and alert the moment stop or target is touched.")
 
 
 def hourly_status(state, hist):
@@ -295,7 +347,10 @@ def daily_scorecard(hist):
     hist["last_summary"] = today
     if not hist["trades"]: return
     wk = [x for x in hist["trades"] if time.time() - x["t"] < 7 * 86400]
-    tg(f"SCORECARD {today}\nLast 7 days: {summarize(wk)}\nAll time: {summarize(hist['trades'])}\n"
+    sg = [x for x in wk if x.get("src") != "trigger"]
+    tr = [x for x in wk if x.get("src") == "trigger"]
+    tg(f"SCORECARD {today}\nBUY signals, 7 days: {summarize(sg)}\n"
+       f"Triggered buys, 7 days: {summarize(tr)}\nAll time: {summarize(hist['trades'])}\n"
        f"(Profit factor above 1.3 over 50+ trades = worth real money. Below 1 = stop.)",
        "Scorecard", "default")
 
@@ -304,7 +359,8 @@ def run():
     state = json.load(open(STATE)) if os.path.exists(STATE) else {}
     hist = json.load(open(HIST)) if os.path.exists(HIST) else {}
     hist.setdefault("trades", [])
-    for step in (lambda: check_open(state, hist), lambda: hourly_status(state, hist),
+    for step in (lambda: check_open(state, hist), lambda: check_triggers(state, hist),
+                 lambda: hourly_status(state, hist),
                  lambda: scan(state, hist), lambda: daily_scorecard(hist)):
         try:
             step()
@@ -317,6 +373,8 @@ def run():
 
 if __name__ == "__main__":
     if "--loop" in sys.argv:
+        tg("Scanner started. It checks every 3 minutes and will send WATCH, BUY, hourly and "
+           "SELL alerts here. If you see this, your phone alerts work.", "Scanner started", "low")
         while True:
             run(); time.sleep(int(os.getenv("LOOP_SECONDS", "180")))
     else:
